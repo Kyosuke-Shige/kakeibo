@@ -1277,18 +1277,39 @@ window.deleteEntry = async function(id) {
 };
 
 /* ===== Firestore 購読 (リアルタイム同期) ===== */
+let historyDisplayCount = 30; // 初期表示件数
+
 function subscribeEntries() {
   if (unsubscribe) unsubscribe();
-  const q = query(collection(db, 'entries'), orderBy('date', 'desc'), orderBy('createdAt', 'desc'));
+  // 複合インデックス不要: 単一フィールドのorderByのみ使い、ソートはクライアント側で行う
+  const q = collection(db, 'entries');
   unsubscribe = onSnapshot(q, (snap) => {
     entries = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    // クライアント側ソート: date降順 → createdAt降順
+    entries.sort((a, b) => {
+      const dateCmp = (b.date || '').localeCompare(a.date || '');
+      if (dateCmp !== 0) return dateCmp;
+      const aTime = a.createdAt?.seconds || 0;
+      const bTime = b.createdAt?.seconds || 0;
+      return bTime - aTime;
+    });
     document.getElementById('issueNo').textContent = String((entries.length || 0) + 1).padStart(3, '0');
     renderHistory();
     renderMonthly();
   }, (err) => {
     console.error('Firestore subscribe error:', err);
+    // ユーザーに見えるエラー表示
+    const section = document.getElementById('historySection');
+    const list = document.getElementById('historyList');
+    section.classList.remove('hidden');
+    list.innerHTML = `<div class="empty-state">データの取得に失敗しました。<br>ページを再読込してください。</div>`;
   });
 }
+
+window.showMoreHistory = function() {
+  historyDisplayCount += 30;
+  renderHistory();
+};
 
 /* ===== 履歴描画 ===== */
 function renderHistory() {
@@ -1302,7 +1323,10 @@ function renderHistory() {
   }
   section.classList.remove('hidden');
 
-  list.innerHTML = entries.map(h => {
+  const visible = entries.slice(0, historyDisplayCount);
+  const hasMore = entries.length > historyDisplayCount;
+
+  list.innerHTML = visible.map(h => {
     const memoBlock = h.memo ? `<div class="history-memo">${escapeHTML(h.memo)}</div>` : '';
     return `
       <article class="history-entry">
@@ -1340,7 +1364,13 @@ function renderHistory() {
         </div>
       </article>
     `;
-  }).join('');
+  }).join('')
+  + (hasMore ? `
+    <div style="text-align:center; padding:24px 0;">
+      <button class="formula-toggle" onclick="showMoreHistory()" style="padding:10px 24px; font-size:11px;">
+        もっと見る（残り ${entries.length - historyDisplayCount} 件）
+      </button>
+    </div>` : '');
 }
 
 function formatDateDisplay(iso) {
