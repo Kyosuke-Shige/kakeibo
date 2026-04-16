@@ -115,16 +115,27 @@ firestore/
 | `grandTotal` | number | 全体合計（= food + elec + gas + water） |
 | `createdAt` | Timestamp | `serverTimestamp()`で記録時刻 |
 
-### クエリ
+### クエリ・ソート戦略
 ```js
-query(
-  collection(db, 'entries'),
-  orderBy('date', 'desc'),
-  orderBy('createdAt', 'desc')
-)
+// Firestoreからは全件取得（orderByなし = 複合インデックス不要）
+const q = collection(db, 'entries');
+
+// クライアント側でソート（date降順 → createdAt降順）
+entries.sort((a, b) => {
+  const dateCmp = (b.date || '').localeCompare(a.date || '');
+  if (dateCmp !== 0) return dateCmp;
+  return (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0);
+});
 ```
 
-按分結果を保存している理由: 過去の按分ルール変更時も **当時の計算結果を保持** するため（再計算しない）。
+**サーバー側orderByを使わない理由**: Firestoreで2つ以上のフィールドに `orderBy` を指定すると複合インデックスの作成が必須。インデックスが未作成の場合、クエリが静かに失敗し **データが表示されない**バグが発生する（初版で実際に発生）。年間300〜400件規模のデータセットではクライアント側ソートのコストは無視できる（1ms以下）。
+
+**按分結果を保存している理由**: 過去の按分ルール変更時も **当時の計算結果を保持** するため（再計算しない）。
+
+### 表示件数制限（ページネーション）
+- 履歴は初期表示 **30件** に制限
+- 「もっと見る」ボタンで30件ずつ追加表示
+- DOM負荷を抑制（年間365件×5年 = 1,800件を一括描画するとiPhoneで描画遅延のリスク）
 
 ---
 
@@ -181,8 +192,9 @@ waterF = water - waterM
     │   ├── Formula Panel（開閉式の計算式表示）
     │   └── 記録するボタン
     │
-    ├── History（記録一覧 / Firestore購読）
-    │   └── Entry × N（日付・総額・男女負担・費目別・メモ・削除）
+    ├── History（記録一覧 / Firestore購読 / 初期30件表示）
+    │   ├── Entry × 30（日付・総額・男女負担・費目別・メモ・削除）
+    │   └── 「もっと見る」ボタン（30件ずつ追加読込）
     │
     ├── Monthly（月次集計）
     │   ├── Trend Chart（SVG棒グラフ、直近6ヶ月）
@@ -203,8 +215,18 @@ waterF = water - waterM
                                 onSnapshot発火
                               ↙              ↘
                      [User A 画面]        [User B 画面]
-                      再レンダリング       再レンダリング
+                      ↓                    ↓
+                  クライアント側ソート     クライアント側ソート
+                      ↓                    ↓
+                  renderHistory()     renderHistory()
+                  renderMonthly()     renderMonthly()
 ```
+
+### エラーハンドリング
+`onSnapshot` の購読が失敗した場合（ネットワーク切断・権限エラー等）:
+- コンソールにエラーログを出力
+- 履歴セクションに「データの取得に失敗しました。ページを再読込してください。」を表示
+- ユーザーが沈黙状態で混乱しないように可視化
 
 ### 初回ログイン時の自動移行
 ```
@@ -261,13 +283,15 @@ service cloud.firestore {
 
 ```
 kakeibo/
-├── index.html          … メインアプリ（GitHub Pages ルート）
-├── bill-split.html     … 同内容のコピー（元ファイル名互換）
+├── index.html          … メインアプリ（GitHub Pages ルート、bill-split.html と同一内容）
+├── bill-split.html     … 元ファイル名のコピー（互換性維持）
 ├── .gitignore
-└── ARCHITECTURE.md     … このドキュメント
+└── ARCHITECTURE.md     … このドキュメント（GitHub上でMermaid図が自動レンダリング）
 ```
 
-**意図的にシンプルな構成**: ビルド成果物なし・依存なし・ファイル1つで完結。将来の自分が見ても即理解できる状態を維持。
+**意図的にシンプルな構成**: ビルド成果物なし・依存なし・HTML1ファイルで完結。将来の自分が見ても即理解できる状態を維持。
+
+**注意**: `index.html` と `bill-split.html` は同一内容。コード変更時は両方更新する必要がある（運用ルール: bill-split.html を編集 → cp で index.html に同期 → commit）。
 
 ---
 
@@ -286,14 +310,18 @@ https://kyosuke-shige.github.io/kakeibo/ に反映
 
 ### Firebase無料枠の実態
 
+想定: 食費は毎日記録 + 月次の光熱費等で **年間300〜400件**、5年で約1,800件。
+
 | リソース | 無料枠上限 | 二人の想定使用量 | 到達率 |
 |---|---|---|---|
-| Firestore 読み取り | 50,000/日 | ~50/日 | 0.1% |
-| Firestore 書き込み | 20,000/日 | ~5/日 | 0.025% |
-| Firestore ストレージ | 1GB | ~1MB（10年分） | 0.1% |
+| Firestore 読み取り | 50,000/日 | 1,800件 × 2人 × 3回起動/日 = ~10,800/日（5年運用後） | 22% |
+| Firestore 書き込み | 20,000/日 | ~3件/日（食費 + 月次） | 0.015% |
+| Firestore ストレージ | 1GB | ~1MB（5年分・1件約500B） | 0.1% |
 | Auth アクティブユーザー | 50,000/月 | 2 | 0.004% |
 
-実質 **永久無料**。課金枠への移行は発生しない。
+5年運用後の最悪ケース読み取り量でも **無料枠の22%** に収まる。実質 **永久無料**。
+
+**前提**: `onSnapshot` は初回購読時に全件読み取り、以降は差分のみ。ページ再読込時に毎回全件取得が発生するため、頻繁に再読込しても枠を超えない設計が必要（クライアント側キャッシュは現状未実装）。
 
 ### トラブルシュート
 
@@ -301,12 +329,30 @@ https://kyosuke-shige.github.io/kakeibo/ に反映
 |---|---|
 | ログインできない | Firebase Console → Authentication → ユーザーが存在するか確認 |
 | データが同期しない | ブラウザのコンソールでエラー確認。承認済みドメインチェック |
+| 履歴が表示されない | 画面に「データの取得に失敗しました」と出る → ネットワーク確認・再読込。コンソールに `permission-denied` の場合はFirestoreルールを確認 |
 | 過去データを復旧したい | Firestoreコンソール → entries コレクション直接閲覧 |
 | パスワード忘れた | Firebase Console → Users → ユーザー選択 → パスワードリセット |
+| 動作が重い（5年運用後） | 履歴の表示件数を30件に制限済み。「もっと見る」で順次表示。月次集計は全件で計算される |
 
 ---
 
-## 13. 拡張ポイント
+## 13. 設計判断ログ（Why の記録）
+
+過去に検討して採用 or 却下した判断を残し、未来の自分が同じ議論を繰り返さないようにする。
+
+| 判断 | 採用案 | 却下案 | 理由 |
+|---|---|---|---|
+| Firestore ソート | クライアント側JS（`Array.sort`） | サーバー側 `orderBy` 複合 | 複合インデックス作成必須・ユーザー操作増・初版で実バグ発生。クライアント側は1,800件で1ms以下 |
+| 履歴表示件数 | 初期30件 + 「もっと見る」 | 全件一括表示 | DOM負荷・iPhone描画遅延の予防 |
+| 認証方式 | 共有1アカウント | 二人別アカウント | 二人専用なので分ける必要なし。権限管理シンプル |
+| データスキーマ | 按分結果も保存 | 入力値のみ保存・表示時に再計算 | 将来按分ルール変更時、過去記録の値が変わると履歴の意味が壊れる |
+| ホスティング | GitHub Pages（Public） | Cloudflare Pages・Vercel | 既存GitHubアカウントで完結・無料・URL推測困難で実質Private |
+| データ取得方式 | `onSnapshot` リアルタイム購読 | 起動時 `getDocs` 1回のみ | 二人で同期する用途のため。書込側の画面に即反映するUXが必須 |
+| サブスクの初回読込キャッシュ | 未実装 | 実装 | 5年後でも無料枠22%。複雑性追加に見合わない |
+
+---
+
+## 14. 拡張ポイント
 
 短期で入れる余地があるもの：
 
@@ -321,15 +367,19 @@ https://kyosuke-shige.github.io/kakeibo/ に反映
 
 ---
 
-## 14. 変更履歴
+## 15. 変更履歴
 
 | 日付 | 変更 |
 |---|---|
 | 2026-04-16 | 初期実装完了・GitHub Pages公開・Firestore連携 |
+| 2026-04-16 | **Bugfix**: Firestoreクエリの複合インデックス問題を修正（`orderBy` 二重指定 → クライアント側ソートに変更）。記録した内容が履歴に表示されないバグを解消 |
+| 2026-04-16 | 履歴表示にページネーション追加（初期30件 +「もっと見る」） |
+| 2026-04-16 | `onSnapshot` 失敗時のユーザー可視エラー表示追加 |
+| 2026-04-16 | ARCHITECTURE.md 作成・GitHub にpush |
 
 ---
 
-## 15. 参考URL
+## 16. 参考URL
 
 - Firebase Console: https://console.firebase.google.com/project/kakeibo-7b4c4/overview
 - Firestore コンソール: https://console.firebase.google.com/project/kakeibo-7b4c4/firestore
